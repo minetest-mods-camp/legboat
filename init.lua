@@ -41,21 +41,42 @@ local leg_offsets = {
   ["backRight"] = vector.new(-0.75, 0, -0.75)
 }
 
--- See the abomination in globalstep for an idea of the structure
-local function update_legboat(legboat, data)
-  if not legboat.object:get_children() then -- Hacky fix for crash when destroyed
-    return
+-- Takes two angles in radians and returns the absolute value of the angle between them
+local function angle_between_rad(a, b)
+  local angle = math.abs(a - b)
+  if angle > math.pi then
+    return 2 * math.pi - angle
   end
+  return angle
+end
 
-  local position = legboat.object:get_pos()
+local function legboat_get_driver(obj)
   local driver
-  for _, child in pairs(legboat.object:get_children()) do
+  for _, child in pairs(obj:get_children()) do
     if (not driver) and child:is_player() then
       driver = child
     else
       child:set_detach()
     end
   end
+  return driver
+end
+
+-- See the abomination in globalstep for an idea of the structure passed to this function
+local function update_legboat(legboat, data, dtime)
+  if not legboat.object:get_children() then -- Hacky fix for crash when destroyed
+    return
+  end
+
+  if not legboat._legboat_leg_lift then
+    legboat._legboat_leg_lift = {}
+  end
+  if not legboat._legboat_leg_interp then
+    legboat._legboat_leg_interp = {}
+  end
+
+  local position = legboat.object:get_pos()
+  local driver = legboat_get_driver(legboat.object)
 
   local velocity = vector.new(0, 0, 0)
   if driver then
@@ -92,11 +113,14 @@ local function update_legboat(legboat, data)
   legboat.object:set_velocity(velocity:rotate(vector.new(0, legboat.object:get_yaw(), 0)))
 
   local stepSet = {}
-  if not legboat._legboat_last_step_pos then
+  if not legboat._legboat_last_step_pos or (legboat._legboat_last_step_angle == nil) then
     legboat._legboat_last_step_pos = legboat.object:get_pos()
-  elseif legboat._legboat_last_step_pos:distance(legboat.object:get_pos()) > 0.5 then
+    legboat._legboat_last_step_angle = legboat.object:get_yaw()
+  elseif legboat._legboat_last_step_pos:distance(legboat.object:get_pos()) +
+      angle_between_rad(legboat.object:get_yaw(), legboat._legboat_last_step_angle) * 2 > 0.5 then
     -- Take a step
     stepSet[legboat._legboat_next_foot] = true
+    legboat._legboat_leg_lift[legboat._legboat_next_foot] = 1
     legboat._legboat_next_foot = ({
       ["frontLeft"] = "backRight",
       ["backRight"] = "frontRight",
@@ -104,6 +128,7 @@ local function update_legboat(legboat, data)
     })[legboat._legboat_next_foot] or "frontLeft"
     legboat._legboat_leg_set = not legboat._legboat_leg_set
     legboat._legboat_last_step_pos = legboat.object:get_pos()
+    legboat._legboat_last_step_angle = legboat.object:get_yaw()
   end
 
   local rotation = legboat.object:get_rotation()
@@ -122,11 +147,11 @@ local function update_legboat(legboat, data)
       entity._legboat_leg = legSlot
     end
 
-    local resting = legboat.object:get_pos():add(leg_target_offsets[legSlot]:rotate(vector.new(0,
-        legboat.object:get_yaw(), 0)))
-
     if not legboat._legboat_leg_targets[legSlot] or stepSet[legSlot] then
+      local resting = legboat.object:get_pos():add(leg_target_offsets[legSlot]:add(
+          velocity:offset(0, -velocity.y, 0):normalize()):rotate(vector.new(0, legboat.object:get_yaw(), 0)))
       local hit = Raycast(resting:offset(0, 6, 0), resting, false, false):next()
+      legboat._legboat_leg_interp[legSlot] = legboat._legboat_leg_targets[legSlot]
       if hit then
         legboat._legboat_leg_targets[legSlot] = hit.intersection_point
       else
@@ -134,8 +159,17 @@ local function update_legboat(legboat, data)
       end
     end
 
-    IK_leg(legboat.object:get_pos():add(leg_offsets[legSlot]:rotate(rotation)), legboat._legboat_leg_targets[legSlot],
-        leg.upper, leg.lower)
+    if (legboat._legboat_leg_lift[legSlot] or 0) > 0 then
+      local interp = legboat._legboat_leg_lift[legSlot]
+      IK_leg(legboat.object:get_pos():add(leg_offsets[legSlot]:rotate(rotation)),
+          legboat._legboat_leg_targets[legSlot]:multiply(1 - interp)
+              :add(legboat._legboat_leg_interp[legSlot]:multiply(interp)):offset(0, (1 - (interp * 2 - 1) ^ 2) * 1.5, 0),
+          leg.upper, leg.lower)
+      legboat._legboat_leg_lift[legSlot] = interp - dtime * 4
+    else
+      IK_leg(legboat.object:get_pos():add(leg_offsets[legSlot]:rotate(rotation)), legboat._legboat_leg_targets[legSlot],
+          leg.upper, leg.lower)
+    end
   end
 end
 
@@ -177,7 +211,7 @@ minetest.register_globalstep(function(dtime)
 
   -- Update all of the legboat legs
   for legboat, data in pairs(legboats) do
-    update_legboat(legboat, data)
+    update_legboat(legboat, data, dtime)
   end
 end)
 
@@ -199,12 +233,17 @@ minetest.register_entity("legboat:legboat", {
   _legboat_parent = false,
   _legboat_next_foot = "frontLeft",
   _legboat_last_step_pos = false, -- Stores the position it last stepped at
-  _legboat_leg_targets = false, -- Will become a table
+  -- _legboat_last_step_yaw = nil
+  -- _legboat_leg_targets = nil, -- Will become a table
+  -- _legboat_leg_interp = nil, -- Will become a table
+  -- _legboat_leg_lift = nil -- Will become a table
   on_activate = function(self)
     self._legboat_leg_targets = {}
   end,
   on_punch = function(self, puncher, time_from_last_punch, tool_capabilities, dir, damage)
-    puncher:set_attach(self.object)
+    if self.object and not legboat_get_driver(self.object) then
+      puncher:set_attach(self.object)
+    end
   end
 })
 
