@@ -50,6 +50,14 @@ local function angle_between_rad(a, b)
   return angle
 end
 
+local function node_name_to_footstep(node_name)
+  local def = minetest.registered_nodes[node_name]
+  if not (def and def.sounds and def.sounds.footstep) then
+    return ""
+  end
+  return def.sounds.footstep
+end
+
 local function legboat_get_driver(obj)
   local driver
   for _, child in pairs(obj:get_children()) do
@@ -62,8 +70,21 @@ local function legboat_get_driver(obj)
   return driver
 end
 
--- See the abomination in globalstep for an idea of the structure passed to this function
-local function update_legboat(legboat, data, dtime)
+local function update_legboat(legboat, dtime)
+  if not legboat._legboat_data then
+    legboat._legboat_data = {
+      legs = {
+        ["frontRight"] = {},
+        ["frontLeft"] = {},
+        ["backLeft"] = {},
+        ["backRight"] = {}
+      }
+    }
+  end
+  if not legboat._legboat_step_sounds then
+    legboat._legboat_step_sounds = {}
+  end
+  local data = legboat._legboat_data
   if not legboat.object:get_children() then -- Hacky fix for crash when destroyed
     return
   end
@@ -81,7 +102,7 @@ local function update_legboat(legboat, data, dtime)
   local velocity = vector.new(0, 0, 0)
   if driver then
     local controls = driver:get_player_control()
-    legboat.object:set_rotation(vector.new(0, driver:get_look_horizontal(), 0))
+    legboat.object:set_rotation(vector.new(0, driver:get_look_horizontal(), 0), true)
     if controls.sneak then
       driver:set_detach()
       driver:set_pos(legboat.object:get_pos():offset(0, 1, 0))
@@ -137,13 +158,13 @@ local function update_legboat(legboat, data, dtime)
     if not leg.upper then
       leg.upper = minetest.add_entity(legboat.object:get_pos(), "legboat:leg_upper")
       local entity = leg.upper:get_luaentity()
-      entity._legboat_parent = legboat
+      entity._legboat_parent = legboat.object
       entity._legboat_leg = legSlot
     end
     if not leg.lower then
       leg.lower = minetest.add_entity(legboat.object:get_pos(), "legboat:leg_lower")
       local entity = leg.lower:get_luaentity()
-      entity._legboat_parent = legboat
+      entity._legboat_parent = legboat.object
       entity._legboat_leg = legSlot
     end
 
@@ -154,18 +175,28 @@ local function update_legboat(legboat, data, dtime)
       legboat._legboat_leg_interp[legSlot] = legboat._legboat_leg_targets[legSlot]
       if hit then
         legboat._legboat_leg_targets[legSlot] = hit.intersection_point
+        legboat._legboat_step_sounds[legSlot] = node_name_to_footstep(minetest.get_node(hit.under).name)
       else
         legboat._legboat_leg_targets[legSlot] = resting
+        legboat._legboat_step_sounds[legSlot] = nil
       end
     end
 
-    if (legboat._legboat_leg_lift[legSlot] or 0) > 0 then
+    if legboat._legboat_leg_lift[legSlot] then
       local interp = legboat._legboat_leg_lift[legSlot]
       IK_leg(legboat.object:get_pos():add(leg_offsets[legSlot]:rotate(rotation)),
           legboat._legboat_leg_targets[legSlot]:multiply(1 - interp)
               :add(legboat._legboat_leg_interp[legSlot]:multiply(interp)):offset(0, (1 - (interp * 2 - 1) ^ 2) * 1.5, 0),
           leg.upper, leg.lower)
-      legboat._legboat_leg_lift[legSlot] = interp - dtime * 4
+      interp = interp - dtime * 4
+      if interp <= 0 then
+        legboat._legboat_leg_lift[legSlot] = nil
+        minetest.sound_play(legboat._legboat_step_sounds[legSlot] or "", {
+          pos = legboat._legboat_leg_targets[legSlot]
+        })
+      else
+        legboat._legboat_leg_lift[legSlot] = interp
+      end
     else
       IK_leg(legboat.object:get_pos():add(leg_offsets[legSlot]:rotate(rotation)), legboat._legboat_leg_targets[legSlot],
           leg.upper, leg.lower)
@@ -174,6 +205,7 @@ local function update_legboat(legboat, data, dtime)
 end
 
 -- Globalstep that drives everything
+--[[
 minetest.register_globalstep(function(dtime)
   -- Parts to be matched to a legboat
   local legboats = {}
@@ -214,11 +246,12 @@ minetest.register_globalstep(function(dtime)
     update_legboat(legboat, data, dtime)
   end
 end)
+]]
 
 -- ENTITIES
 --[[
   There are some custom properties used to keep track of vital data
-  None of these entities have any on_step, because all of the updates are handled through the globalstep
+  In theory, unless a body "forgets" a leg without destroying it, stray part entities will always be cleaned up.
 ]]
 
 minetest.register_entity("legboat:legboat", {
@@ -229,6 +262,7 @@ minetest.register_entity("legboat:legboat", {
   },
   physical = true,
   collisionbox = {-0.75, -0.1, -0.75, 0.75, 0.1, 0.1},
+  selectionbox = {-0.75, -0.1, -0.75, 0.75, 0.1, 0.1, rotate = true},
   _legboat_entityType = "legboat",
   _legboat_parent = false,
   _legboat_next_foot = "frontLeft",
@@ -240,7 +274,8 @@ minetest.register_entity("legboat:legboat", {
   on_activate = function(self)
     self._legboat_leg_targets = {}
   end,
-  on_punch = function(self, puncher, time_from_last_punch, tool_capabilities, dir, damage)
+  on_step = update_legboat,
+  on_rightclick = function(self, puncher, time_from_last_punch, tool_capabilities, dir, damage)
     if self.object and not legboat_get_driver(self.object) then
       puncher:set_attach(self.object)
     end
@@ -254,6 +289,11 @@ minetest.register_entity("legboat:leg_upper", {
     textures = {"default_wood.png"},
     pointable = false
   },
+  on_step = function(self)
+    if not (self._legboat_parent and self._legboat_parent:get_pos()) then
+      self.object:remove()
+    end
+  end,
   _legboat_entityType = "upperLeg",
   _legboat_parent = false,
   _legboat_leg = "frontLeft"
@@ -266,15 +306,20 @@ minetest.register_entity("legboat:leg_lower", {
     textures = {"default_wood.png"},
     pointable = false
   },
-  _legboat_entityType = "lowerLeg",
-  _legboat_parent = false,
-  _legboat_leg = "frontLeft"
+  on_step = function(self)
+    if not (self._legboat_parent and self._legboat_parent:get_pos()) then
+      self.object:remove()
+    end
+  end,
+  _legboat_entityType = "lowerLeg"
+  -- _legboat_parent = nil,
+  -- _legboat_leg = "frontLeft"
 })
 
 minetest.register_tool("legboat:legboat_egg", {
   description = "Legboat egg",
   inventory_image = "boats_inventory.png",
-  on_use = function(itemstack, user, pointed_thing)
+  on_place = function(itemstack, user, pointed_thing)
     minetest.add_entity(user:get_pos(), "legboat:legboat")
     return ItemStack()
   end
